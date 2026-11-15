@@ -27,7 +27,8 @@ use crate::io::cache::LocalCache;
 use crate::io::FileRead;
 use crate::table::ArrowRecordBatchStream;
 use crate::{Error, Result};
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_data::ArrayData;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_row::{RowConverter, SortField};
 use bytes::Bytes;
@@ -279,7 +280,7 @@ impl LookupFileCache {
             if batch.num_rows() == 0 {
                 continue;
             }
-            if batch.get_array_memory_size() > self.limit {
+            if retained_bytes(&batch) > self.limit {
                 return Err(exhausted("Lookup input batch exceeds lookup.cache-max-memory-size; reduce read.batch-size"));
             }
             if keys.is_empty() || keys.iter().any(|&index| index >= batch.num_columns()) {
@@ -517,7 +518,7 @@ impl LookupFileCache {
                 if stream.next().is_some() {
                     return Err(invalid("Lookup IPC payload contains multiple batches"));
                 }
-                if batch.get_array_memory_size() > self.limit {
+                if retained_bytes(&batch) > self.limit {
                     return Err(exhausted("Decoded Lookup IPC exceeds the memory budget"));
                 }
                 *self.payload.lock().unwrap() = Some(Payload {
@@ -535,6 +536,31 @@ impl LookupFileCache {
             .map(|batch| Some((batch, pointer.position)))
             .map_err(invalid)
     }
+}
+
+/// Bytes of the allocations a batch keeps alive, each counted once.
+///
+/// `get_array_memory_size` adds a buffer's whole allocation for every buffer
+/// that points into it. A batch decoded from IPC is one message body that
+/// every column slices, so it would be counted once per buffer.
+fn retained_bytes(batch: &RecordBatch) -> usize {
+    fn visit(data: &ArrayData, seen: &mut HashMap<usize, usize>) {
+        for buffer in data.buffers() {
+            seen.insert(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+        if let Some(nulls) = data.nulls() {
+            let buffer = nulls.buffer();
+            seen.insert(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+        for child in data.child_data() {
+            visit(child, seen);
+        }
+    }
+    let mut seen = HashMap::new();
+    for column in batch.columns() {
+        visit(&column.to_data(), &mut seen);
+    }
+    seen.values().sum()
 }
 
 #[derive(Clone, Copy)]
@@ -1183,5 +1209,49 @@ mod tests {
         assert!(matches!(&error, Error::ResourceExhausted { .. }), "{error}");
         assert!(error.to_string().contains("SST construction"), "{error}");
         assert!(descriptor(&cache, "index-limit").await.is_none());
+    }
+
+    /// A decoded IPC batch is one message buffer that every column slices;
+    /// it costs the buffer once, not once per column.
+    #[tokio::test]
+    async fn decoded_payloads_count_their_shared_buffer_once() {
+        let options = HashMap::from([
+            ("lookup.cache-max-memory-size".into(), "1mb".into()),
+            ("lookup.cache-spill-compression".into(), "none".into()),
+        ]);
+        let cache = LookupFileCache::new(local(None, false, "4mb"), &options).unwrap();
+        let wide = || {
+            let ids = (0..100).collect::<Vec<i32>>();
+            let mut columns = vec![(
+                "id".to_string(),
+                Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+            )];
+            for column in 0..10 {
+                let values = ids
+                    .iter()
+                    .map(|id| format!("{id:>8}-{column:>2}-{}", "w".repeat(68)))
+                    .collect::<Vec<_>>();
+                columns.push((
+                    format!("c{column}"),
+                    Arc::new(StringArray::from(values)) as ArrayRef,
+                ));
+            }
+            let batch = RecordBatch::try_from_iter(columns).map_err(invalid)?;
+            assert!(batch.get_array_memory_size() < 128 * 1024);
+            Ok(stream::iter(vec![Ok(batch)]).boxed())
+        };
+        let row = cache
+            .lookup("wide", &key(42), &[0], wide)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.column(10)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            format!("{:>8}-{:>2}-{}", 42, 9, "w".repeat(68))
+        );
     }
 }
