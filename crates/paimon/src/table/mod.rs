@@ -433,6 +433,33 @@ impl Table {
         )
     }
 
+    /// The directory of `bucket` in the partition a manifest entry names
+    /// (`ManifestEntry::partition`, serialized), where that entry's data
+    /// files and their extra files live.
+    ///
+    /// For callers that act on files outside a scan, such as snapshot
+    /// expiry and orphan cleanup: a path computed any other way can
+    /// disagree with the writer's by one segment and miss the file.
+    pub fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {
+        let schema = self.schema();
+        let computer = if schema.partition_keys().is_empty() {
+            None
+        } else {
+            let options = schema.core_options();
+            Some(crate::spec::PartitionComputer::new(
+                schema.partition_keys(),
+                schema.fields(),
+                options.partition_default_name(),
+                options.legacy_partition_name(),
+            )?)
+        };
+        let row = match computer {
+            None => crate::spec::BinaryRow::new(0),
+            Some(_) => crate::spec::BinaryRow::from_serialized_bytes(partition)?,
+        };
+        crate::spec::bucket_path(&self.data_file_location(), computer.as_ref(), &row, bucket)
+    }
+
     /// Get the table's schema.
     pub fn schema(&self) -> &TableSchema {
         &self.schema
@@ -1281,7 +1308,51 @@ mod tests {
     use super::Table;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataType, IntType, Schema, TableSchema};
+    use crate::spec::{
+        BinaryRowBuilder, DataType, DateType, IntType, Schema, TableSchema, VarCharType,
+    };
+
+    fn table(schema: Schema) -> Table {
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "t"),
+            "memory:/w/t".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_bucket_path_names_the_partition_directories() {
+        let partitioned = table(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("dt", DataType::Date(DateType::new()))
+                .column("region", DataType::VarChar(VarCharType::string_type()))
+                .partition_keys(["dt", "region"])
+                .option("partition.legacy-name", "false")
+                .build()
+                .unwrap(),
+        );
+        let mut row = BinaryRowBuilder::new(2);
+        row.write_int(0, 19_723); // 2024-01-01
+        row.write_string(1, "eu/west");
+        let partition = row.build().to_serialized_bytes();
+        assert_eq!(
+            partitioned.bucket_path(&partition, 3).unwrap(),
+            "memory:/w/t/dt=2024-01-01/region=eu%2Fwest/bucket-3"
+        );
+
+        let flat = table(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let empty = BinaryRowBuilder::new(0).build().to_serialized_bytes();
+        assert_eq!(flat.bucket_path(&empty, 0).unwrap(), "memory:/w/t/bucket-0");
+        assert_eq!(flat.bucket_path(&[], 1).unwrap(), "memory:/w/t/bucket-1");
+    }
 
     /// The value every reader and writer of a bucket-local index file consults.
     ///
